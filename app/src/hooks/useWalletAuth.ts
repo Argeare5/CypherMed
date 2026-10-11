@@ -1,14 +1,24 @@
 import { useCallback } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
+import { buildMessage } from "@tuwaio/siwx-core";
+import { createSolanaSiwxSigner } from "@tuwaio/siwx-solana";
 import { useAuthStore } from "@/store/authStore";
+import { useUserStore } from "@/store/userStore";
 import axios from "axios";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "https://cyphermed.onrender.com";
 
+// CAIP-2 chain ID of Solana devnet: the backend accepts sign-in messages for this cluster only
+const DEVNET_CHAIN_ID = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+// The signed message, and the session it opens, stay valid for at most 7 days
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 export function useWalletAuth() {
   const wallet = useWallet();
   const { setWallet, setTokens, setLoading, setError, logout } = useAuthStore();
+  const clearProfile = useUserStore((state) => state.clearProfile);
 
   const signAndVerify = useCallback(async () => {
     if (!wallet.publicKey || !wallet.signMessage) {
@@ -22,33 +32,37 @@ export function useWalletAuth() {
 
       const address = wallet.publicKey.toBase58();
 
-      // 1. Get a nonce from backend
-      const nonceRes = await axios.post(`${API_BASE_URL}/api/auth/nonce`, {
-        walletAddress: address,
-      });
+      // 1. Get a single-use nonce from backend
+      const nonceRes = await axios.post(`${API_BASE_URL}/api/auth/nonce`);
 
       if (!nonceRes.data.nonce) {
         throw new Error("No nonce received from server");
       }
 
-      const nonce = nonceRes.data.nonce;
+      // 2. Sign a SIWX (CAIP-122) message bound to this site, devnet and an expiry
+      const issuedAt = new Date();
+      const message = buildMessage({
+        domain: window.location.host,
+        address: `${DEVNET_CHAIN_ID}:${address}`,
+        statement:
+          "Sign in to CypherMed. This does not send a transaction or cost any fees.",
+        uri: window.location.origin,
+        version: "1",
+        chainId: DEVNET_CHAIN_ID,
+        nonce: nonceRes.data.nonce,
+        issuedAt: issuedAt.toISOString(),
+        expirationTime: new Date(
+          issuedAt.getTime() + SESSION_TTL_MS
+        ).toISOString(),
+      });
+      const signature = await createSolanaSiwxSigner({
+        signMessage: wallet.signMessage,
+      })(message);
 
-      // 2. Sign the nonce with wallet
-      const message = new TextEncoder().encode(nonce);
-      const signedMessage = await wallet.signMessage(message);
-
-      if (!signedMessage) {
-        throw new Error("Failed to sign message");
-      }
-
-      // 3. Verify signature on backend
+      // 3. Verify the message and signature on backend
       const verifyRes = await axios.post(
         `${API_BASE_URL}/api/auth/verify-signature`,
-        {
-          walletAddress: address,
-          nonce,
-          signature: Buffer.from(signedMessage).toString("base64"),
-        }
+        { message, signature }
       );
 
       if (verifyRes.data.accessToken) {
@@ -68,12 +82,24 @@ export function useWalletAuth() {
     }
   }, [wallet, setWallet, setTokens, setLoading, setError]);
 
+  // Disconnects fully, in this order: the backend session (so its tokens stop working everywhere), then the
+  // wallet, then the local tokens and profile. Clearing the profile while the wallet is still connected would
+  // send /connect to the role step for a wallet that is about to disconnect.
   const handleLogout = useCallback(async () => {
+    const { accessToken } = useAuthStore.getState();
+    if (accessToken) {
+      await axios
+        .post(`${API_BASE_URL}/api/auth/logout`, undefined, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        })
+        .catch(() => undefined);
+    }
     if (wallet.disconnect) {
-      await wallet.disconnect();
+      await wallet.disconnect().catch(() => undefined);
     }
     logout();
-  }, [wallet, logout]);
+    clearProfile();
+  }, [wallet, logout, clearProfile]);
 
   return {
     signAndVerify,

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useUserStore } from "@/store/userStore";
+import { useWalletAuth } from "@/hooks/useWalletAuth";
 import {
   getAuditLogs,
   getNotifications,
@@ -78,8 +79,9 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
 }
 
 export default function PatientDashboard() {
-  const { connected, publicKey, disconnect } = useWallet();
-  const { profile, clearProfile } = useUserStore();
+  const { connected, publicKey } = useWallet();
+  const { profile } = useUserStore();
+  const { logout } = useWalletAuth();
   const router = useRouter();
   const walletAddress = publicKey?.toBase58();
   const [records, setRecords] = useState<any[]>([]);
@@ -119,10 +121,9 @@ export default function PatientDashboard() {
   const shortAddress = walletAddress
     ? `${walletAddress.slice(0, 5)}...${walletAddress.slice(-4)}`
     : "";
-  const handleDisconnect = () => {
-    clearProfile();
-    disconnect();
-    router.push("/connect");
+  const handleDisconnect = async () => {
+    await logout();
+    router.replace("/connect");
   };
   const activity = auditEvents.slice(0, 3);
   const unread = notifications.filter((item) => !item.read).length;
@@ -208,12 +209,22 @@ export default function PatientDashboard() {
             </Link>
             <button
               onClick={handleDisconnect}
-              className="flex items-center gap-2 rounded-xl border border-[#dfe8e2] bg-white px-3 py-2 text-xs font-semibold text-[#53655c]"
+              aria-label="Disconnect wallet"
+              title="Disconnect wallet"
+              className="group flex items-center gap-2 rounded-xl border border-[#dfe8e2] bg-white px-3 py-2 text-xs font-semibold text-[#53655c] transition-colors duration-200 hover:border-[#efd3c5] hover:text-[#b9592f] focus-visible:border-[#efd3c5] focus-visible:text-[#b9592f]"
             >
-              <span className="h-6 w-6 rounded-full bg-[#cfe7d5] text-center leading-6 text-[#176b52]">
+              <span className="h-6 w-6 rounded-full bg-[#cfe7d5] text-center leading-6 text-[#176b52] transition-colors duration-200 group-hover:bg-[#f8e3d8] group-hover:text-[#b9592f] group-focus-visible:bg-[#f8e3d8] group-focus-visible:text-[#b9592f]">
                 P
               </span>
-              <span className="hidden sm:inline">{shortAddress}</span>
+              {/* The address and the label share one grid cell, so the button keeps its width on hover */}
+              <span className="hidden sm:inline-grid">
+                <span className="col-start-1 row-start-1 transition-opacity duration-200 group-hover:opacity-0 group-focus-visible:opacity-0">
+                  {shortAddress}
+                </span>
+                <span className="col-start-1 row-start-1 text-center opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100">
+                  Disconnect
+                </span>
+              </span>
             </button>
           </div>
         </header>

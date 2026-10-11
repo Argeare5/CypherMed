@@ -1,52 +1,56 @@
-import { Router, Request, Response } from "express";
-import jwt from "jsonwebtoken";
-import { PublicKey } from "@solana/web3.js";
-import { verifySignature, generateNonce } from "../utils/wallet";
+import { Router, Request, Response, NextFunction } from "express";
+import jwt, { JwtPayload } from "jsonwebtoken";
+import { generateNonce } from "@tuwaio/siwx-core";
 import prisma from "../prisma";
+import {
+  NONCE_TTL_SECONDS,
+  SESSION_TTL_SECONDS,
+  nonceStore,
+  readJwtSecret,
+  sessionStore,
+  siwxPolicy,
+  verifySignIn,
+  walletOf,
+} from "../auth/siwx";
 
 const router = Router();
 
-const JWT_SECRET =
-  process.env.JWT_SECRET || "test-secret-key-change-in-production";
-const JWT_EXPIRY = "7d";
+const JWT_SECRET = readJwtSecret();
+// Read at startup, so a malformed SIWX_ALLOWED_ORIGINS stops the backend instead of failing every sign-in
+const SIWX_POLICY = siwxPolicy();
 
-// Store nonces temporarily (in production, use Redis)
-const nonceStore = new Map<string, { nonce: string; timestamp: number }>();
+type TokenClaims = {
+  userId: string;
+  walletAddress: string;
+  role: string;
+  sid: string;
+};
+
+/** Signs the access and refresh tokens of a session; both expire with it. */
+function signTokens(claims: TokenClaims, sessionExpiresAt: number) {
+  const expiresIn = Math.max(
+    1,
+    Math.floor((sessionExpiresAt - Date.now()) / 1000)
+  );
+  return {
+    accessToken: jwt.sign({ ...claims, type: "access" }, JWT_SECRET, {
+      algorithm: "HS256",
+      expiresIn,
+    }),
+    refreshToken: jwt.sign({ ...claims, type: "refresh" }, JWT_SECRET, {
+      algorithm: "HS256",
+      expiresIn,
+    }),
+  };
+}
 
 /**
- * Generate a nonce for the user to sign
+ * Generate a nonce for the sign-in message. It works once and expires after 5 minutes.
  */
-router.post("/nonce", async (req: Request, res: Response) => {
+router.post("/nonce", async (_req: Request, res: Response) => {
   try {
-    const { walletAddress } = req.body;
-
-    if (!walletAddress) {
-      return res.status(400).json({ error: "walletAddress is required" });
-    }
-
-    // Decode the key instead of assuming a fixed base58 string length.
-    try {
-      new PublicKey(walletAddress);
-    } catch {
-      return res.status(400).json({ error: "Invalid Solana wallet address" });
-    }
-
-    // Generate nonce
     const nonce = generateNonce();
-
-    // Store nonce (expires in 10 minutes)
-    nonceStore.set(walletAddress, {
-      nonce,
-      timestamp: Date.now(),
-    });
-
-    // Clean up old nonces (older than 30 minutes)
-    for (const [key, value] of nonceStore.entries()) {
-      if (Date.now() - value.timestamp > 30 * 60 * 1000) {
-        nonceStore.delete(key);
-      }
-    }
-
+    await nonceStore.issue({ nonce, ttlSeconds: NONCE_TTL_SECONDS });
     res.json({ nonce });
   } catch (err: any) {
     console.error("Nonce generation error:", err);
@@ -55,43 +59,28 @@ router.post("/nonce", async (req: Request, res: Response) => {
 });
 
 /**
- * Verify signed message and issue JWT token
+ * Verify a signed sign-in message (SIWX, CAIP-122) and issue JWT tokens bound to a new session
  */
 router.post("/verify-signature", async (req: Request, res: Response) => {
   try {
-    const { walletAddress, nonce, signature } = req.body;
+    const { message, signature } = req.body ?? {};
 
-    if (!walletAddress || !nonce || !signature) {
+    if (typeof message !== "string" || typeof signature !== "string") {
       return res
         .status(400)
-        .json({ error: "walletAddress, nonce, and signature are required" });
+        .json({ error: "message and signature are required" });
     }
 
-    // Get stored nonce
-    const storedNonce = nonceStore.get(walletAddress);
-    if (!storedNonce) {
-      return res.status(400).json({ error: "Nonce not found or expired" });
+    const result = await verifySignIn({ message, signature }, SIWX_POLICY);
+    if ("error" in result) {
+      return res.status(401).json({ error: result.error });
     }
 
-    // Check nonce expiry (10 minutes)
-    if (Date.now() - storedNonce.timestamp > 10 * 60 * 1000) {
-      nonceStore.delete(walletAddress);
-      return res.status(400).json({ error: "Nonce expired" });
-    }
-
-    // Verify nonce matches
-    if (storedNonce.nonce !== nonce) {
-      return res.status(400).json({ error: "Invalid nonce" });
-    }
-
-    // Verify signature
-    const isValid = verifySignature(nonce, signature, walletAddress);
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    // Remove used nonce
-    nonceStore.delete(walletAddress);
+    const record = await sessionStore.create({
+      session: result.session,
+      ttlSeconds: SESSION_TTL_SECONDS,
+    });
+    const walletAddress = walletOf(record.session.address);
 
     // Create or get user
     let user = await prisma.patient.findUnique({
@@ -109,29 +98,15 @@ router.post("/verify-signature", async (req: Request, res: Response) => {
       });
     }
 
-    // Generate JWT tokens
-    const accessToken = jwt.sign(
-      {
-        userId: user.id,
-        walletAddress,
-        role: "patient",
-      },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRY }
-    );
+    await sessionStore.bindSubject(record.id, user.id);
 
-    const refreshToken = jwt.sign(
-      {
-        userId: user.id,
-        walletAddress,
-      },
-      JWT_SECRET,
-      { expiresIn: "30d" }
+    const tokens = signTokens(
+      { userId: user.id, walletAddress, role: "patient", sid: record.id },
+      record.expiresAt
     );
 
     res.json({
-      accessToken,
-      refreshToken,
+      ...tokens,
       user: {
         id: user.id,
         wallet: user.wallet,
@@ -145,28 +120,38 @@ router.post("/verify-signature", async (req: Request, res: Response) => {
 });
 
 /**
- * Refresh access token using refresh token
+ * Refresh the access token while the session is active
  */
-router.post("/refresh", (req: Request, res: Response) => {
-  try {
-    const { refreshToken } = req.body;
+router.post("/refresh", async (req: Request, res: Response) => {
+  const { refreshToken } = req.body ?? {};
 
-    if (!refreshToken) {
-      return res.status(400).json({ error: "refreshToken is required" });
+  if (!refreshToken) {
+    return res.status(400).json({ error: "refreshToken is required" });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_SECRET, {
+      algorithms: ["HS256"],
+    }) as JwtPayload;
+    if (decoded.type !== "refresh" || typeof decoded.sid !== "string") {
+      return res
+        .status(401)
+        .json({ error: "Invalid or expired refresh token" });
     }
 
-    // Verify refresh token
-    const decoded = jwt.verify(refreshToken, JWT_SECRET) as any;
+    const record = await sessionStore.get(decoded.sid);
+    if (!record) {
+      return res.status(401).json({ error: "Session expired or revoked" });
+    }
 
-    // Generate new access token
-    const accessToken = jwt.sign(
+    const { accessToken } = signTokens(
       {
         userId: decoded.userId,
         walletAddress: decoded.walletAddress,
-        role: "patient",
+        role: decoded.role,
+        sid: decoded.sid,
       },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRY }
+      record.expiresAt
     );
 
     res.json({ accessToken });
@@ -176,9 +161,14 @@ router.post("/refresh", (req: Request, res: Response) => {
 });
 
 /**
- * Middleware to verify JWT token
+ * Middleware to verify the JWT access token and that its session is still active
  */
-export function verifyToken(req: Request, res: Response, next: Function) {
+export async function verifyToken(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  let decoded: JwtPayload;
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -188,13 +178,36 @@ export function verifyToken(req: Request, res: Response, next: Function) {
     }
 
     const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ["HS256"],
+    }) as JwtPayload;
+    if (decoded.type !== "access" || typeof decoded.sid !== "string") {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
 
-    (req as any).user = decoded;
-    next();
+    if (!(await sessionStore.get(decoded.sid))) {
+      return res.status(401).json({ error: "Session expired or revoked" });
+    }
   } catch (err: any) {
-    res.status(401).json({ error: "Invalid or expired token" });
+    return res.status(401).json({ error: "Invalid or expired token" });
   }
+
+  // Outside the try block: an error thrown by the next handler must not turn into a 401
+  (req as any).user = decoded;
+  next();
 }
+
+/**
+ * Revoke the session of the access token: it and its refresh token stop working
+ */
+router.post("/logout", verifyToken, async (req: Request, res: Response) => {
+  try {
+    await sessionStore.revoke((req as any).user.sid);
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Logout error:", err);
+    res.status(500).json({ error: "Logout failed" });
+  }
+});
 
 export default router;

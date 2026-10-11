@@ -12,3 +12,5 @@ services:
         sync: false
       - key: JWT_SECRET
         sync: false
+      - key: SIWX_ALLOWED_ORIGINS
+        sync: false

@@ -1,5 +1,43 @@
 # CypherMed API Endpoints
 
+## Auth API (SIWX)
+
+Wallet sign-in with SIWX (Sign In With Solana, CAIP-122). Protected routes take `Authorization: Bearer <accessToken>`.
+
+### Get a Nonce
+```http
+POST /api/auth/nonce
+```
+Returns `{ "nonce": "..." }`. The nonce works once and expires after 5 minutes.
+
+### Verify a Signed Message
+```http
+POST /api/auth/verify-signature
+Content-Type: application/json
+
+{
+  "message": "localhost:3001 wants you to sign in with your Solana account: ...",
+  "signature": "<base58 signature>"
+}
+```
+The message must use a nonce from `/nonce`, one of the `SIWX_ALLOWED_ORIGINS` as its domain and URI, Solana devnet, and an expiration time within 7 days. Returns `{ accessToken, refreshToken, user }`; both tokens are bound to a server session. Errors: `400` (missing fields), `401` (wrong domain or network, invalid signature, nonce expired or already used).
+
+### Refresh the Access Token
+```http
+POST /api/auth/refresh
+Content-Type: application/json
+
+{ "refreshToken": "..." }
+```
+Returns `{ accessToken }` while the session is active, `401` after logout or expiry.
+
+### Log Out
+```http
+POST /api/auth/logout
+Authorization: Bearer <accessToken>
+```
+Revokes the session: its access and refresh tokens stop working at once.
+
 ## Patients API
 
 ### List All Patients
