@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import prisma from "../prisma";
+import { isProviderRole, roleOf } from "../auth/roles";
 import {
   notifyAccessRequest,
   notifyAccessGranted,
@@ -11,13 +12,21 @@ const router = Router();
 // Create a new access request
 router.post("/", async (req: Request, res: Response) => {
   try {
-    const { patientId, role, reason, expiresAt } = req.body;
+    const { patientId, reason, expiresAt } = req.body;
     const requester = (req as any).user?.walletAddress;
 
-    if (!patientId || !requester || !role) {
+    if (!patientId || !requester) {
       return res.status(400).json({
-        error: "patientId, requester, and role are required",
+        error: "patientId is required",
       });
+    }
+
+    // The requester's role comes from the provider registration on the server, not from the request body
+    const role = await roleOf(requester);
+    if (!isProviderRole(role)) {
+      return res
+        .status(403)
+        .json({ error: "Only registered providers can request access" });
     }
 
     // Verify patient exists

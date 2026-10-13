@@ -61,6 +61,7 @@ export default function ProviderDashboard() {
   const { connected, publicKey } = useWallet();
   const { profile } = useUserStore();
   const { logout } = useWalletAuth();
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const router = useRouter();
   const [requests, setRequests] = useState<AccessRequest[]>([]);
   const [loading, setLoading] = useState(true);
@@ -95,7 +96,12 @@ export default function ProviderDashboard() {
     insurer: "Insurance provider",
   };
   const handleDisconnect = async () => {
-    await logout();
+    setLogoutError(null);
+    const result = await logout();
+    if (!result.ok) {
+      setLogoutError(result.error);
+      return;
+    }
     router.replace("/connect");
   };
   const pendingRequests = requests.filter(
@@ -191,6 +197,14 @@ export default function ProviderDashboard() {
             </button>
           </div>
         </header>
+        {logoutError && (
+          <div
+            role="alert"
+            className="mx-auto mt-4 max-w-[1320px] rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 sm:mx-8 lg:mx-12"
+          >
+            {logoutError}
+          </div>
+        )}
         <div className="mx-auto max-w-[1320px] px-5 py-8 sm:px-8 lg:px-12 lg:py-12">
           {pending && (
             <div className="mb-7 rounded-2xl border border-[#f0d6ad] bg-[#fff8ea] p-4 text-sm text-[#805d29]">

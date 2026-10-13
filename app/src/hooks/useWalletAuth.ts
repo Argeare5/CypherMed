@@ -15,15 +15,36 @@ const DEVNET_CHAIN_ID = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 // The signed message, and the session it opens, stay valid for at most 7 days
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+const LOGOUT_FAILED =
+  "We couldn't confirm that your session ended on the server, so you're still signed in. Check your connection and try again.";
+
+// Ends the session on the server, retrying once. A 401 means it already expired or was revoked.
+async function endServerSession(accessToken: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await axios.post(`${API_BASE_URL}/api/auth/logout`, undefined, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      return true;
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 401) return true;
+      if (attempt === 0)
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  return false;
+}
+
 export function useWalletAuth() {
   const wallet = useWallet();
   const { setWallet, setTokens, setLoading, setError, logout } = useAuthStore();
   const clearProfile = useUserStore((state) => state.clearProfile);
 
-  const signAndVerify = useCallback(async () => {
+  // Signs in and returns the role the server has on record for the wallet, or null when sign-in failed
+  const signAndVerify = useCallback(async (): Promise<string | null> => {
     if (!wallet.publicKey || !wallet.signMessage) {
       setError("Wallet not connected");
-      return false;
+      return null;
     }
 
     try {
@@ -69,7 +90,7 @@ export function useWalletAuth() {
         setWallet(address);
         setTokens(verifyRes.data.accessToken, verifyRes.data.refreshToken);
         setLoading(false);
-        return true;
+        return (verifyRes.data.user?.role as string | undefined) ?? "patient";
       } else {
         throw new Error("Verification failed");
       }
@@ -78,27 +99,27 @@ export function useWalletAuth() {
         err.response?.data?.error || err.message || "Authentication failed";
       setError(errorMsg);
       setLoading(false);
-      return false;
+      return null;
     }
   }, [wallet, setWallet, setTokens, setLoading, setError]);
 
   // Disconnects fully, in this order: the backend session (so its tokens stop working everywhere), then the
   // wallet, then the local tokens and profile. Clearing the profile while the wallet is still connected would
-  // send /connect to the role step for a wallet that is about to disconnect.
-  const handleLogout = useCallback(async () => {
+  // send /connect to the role step for a wallet that is about to disconnect. If the server can't confirm that
+  // the session ended, nothing is cleared and the error is returned: the patient's access has not ended yet.
+  const handleLogout = useCallback(async (): Promise<
+    { ok: true } | { ok: false; error: string }
+  > => {
     const { accessToken } = useAuthStore.getState();
-    if (accessToken) {
-      await axios
-        .post(`${API_BASE_URL}/api/auth/logout`, undefined, {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        })
-        .catch(() => undefined);
+    if (accessToken && !(await endServerSession(accessToken))) {
+      return { ok: false, error: LOGOUT_FAILED };
     }
     if (wallet.disconnect) {
       await wallet.disconnect().catch(() => undefined);
     }
     logout();
     clearProfile();
+    return { ok: true };
   }, [wallet, logout, clearProfile]);
 
   return {

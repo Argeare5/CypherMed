@@ -147,3 +147,19 @@ model AuthSession {
 
   @@index([wallet])
 }
+
+// Healthcare providers, registered by their own signed-in wallet (POST /api/auth/provider). The role in the JWTs and
+// in access requests comes from here, never from the browser; only the server changes verificationStatus.
+model Provider {
+  id                 String   @id @default(uuid())
+  wallet             String   @unique
+  role               String   // doctor, nurse, hospital_admin, insurer
+  name               String
+  email              String?
+  licenseNumber      String?
+  specialty          String?
+  institution        String?
+  verificationStatus String   @default("pending")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}

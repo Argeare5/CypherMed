@@ -7,11 +7,14 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import express from "express";
+import jwt, { type JwtPayload } from "jsonwebtoken";
 import { getBase58Decoder } from "@solana/kit";
 import { buildMessage, generateNonce } from "@tuwaio/siwx-core";
 import prisma from "../src/prisma";
 import authRouter, { verifyToken } from "../src/routes/auth";
+import accessRequestsRouter from "../src/routes/accessRequests";
 import { readJwtSecret, siwxPolicy } from "../src/auth/siwx";
+import { createRateLimiter } from "../src/auth/rateLimit";
 
 const DEVNET = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 const MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
@@ -112,12 +115,30 @@ before(async () => {
   app.get("/api/me", verifyToken, (req, res) =>
     res.json({ user: (req as any).user })
   );
+  app.use("/api/access-requests", verifyToken, accessRequestsRouter);
   server = app.listen(0);
   await once(server, "listening");
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 
 after(async () => {
+  const patients = await prisma.patient.findMany({
+    where: { wallet: { in: createdWallets } },
+    select: { id: true },
+  });
+  const patientIds = patients.map((patient) => patient.id);
+  await prisma.notification.deleteMany({
+    where: { patientId: { in: patientIds } },
+  });
+  await prisma.auditEvent.deleteMany({
+    where: { patientId: { in: patientIds } },
+  });
+  await prisma.accessRequest.deleteMany({
+    where: { patientId: { in: patientIds } },
+  });
+  await prisma.provider.deleteMany({
+    where: { wallet: { in: createdWallets } },
+  });
   await prisma.authSession.deleteMany({
     where: { wallet: { in: createdWallets } },
   });
@@ -261,5 +282,189 @@ describe("other sign-in checks", () => {
     assert.throws(() => readJwtSecret({ JWT_SECRET: "too-short" }));
     const secret = "x".repeat(32);
     assert.equal(readJwtSecret({ JWT_SECRET: secret }), secret);
+  });
+});
+
+const doctor = {
+  role: "doctor",
+  name: "Dr. Test",
+  email: "dr.test@example.com",
+  licenseNumber: "LIC-1",
+  specialty: "Cardiology",
+  institution: "Test Clinic",
+};
+
+function roleOf(token: string) {
+  return (jwt.decode(token) as JwtPayload).role;
+}
+
+describe("roles verified by the server", () => {
+  it("signs in as a patient until the wallet registers as a provider", async () => {
+    const { body } = await signIn(newWallet());
+    assert.equal(body.user.role, "patient");
+    assert.equal(roleOf(body.accessToken), "patient");
+    const me = await request("GET", "/api/auth/me", {
+      token: body.accessToken,
+    });
+    assert.equal(me.status, 200);
+    assert.equal(me.body.role, "patient");
+    assert.equal(me.body.provider, null);
+  });
+
+  it("registers the signed-in wallet as a provider and issues tokens with that role", async () => {
+    const wallet = newWallet();
+    const { body } = await signIn(wallet);
+    const registered = await request("POST", "/api/auth/provider", {
+      token: body.accessToken,
+      body: doctor,
+    });
+    assert.equal(registered.status, 201);
+    assert.equal(registered.body.provider.wallet, wallet.address);
+    assert.equal(registered.body.provider.role, "doctor");
+    assert.equal(registered.body.provider.verificationStatus, "pending");
+    assert.equal(roleOf(registered.body.accessToken), "doctor");
+
+    const me = await request("GET", "/api/auth/me", {
+      token: registered.body.accessToken,
+    });
+    assert.equal(me.body.role, "doctor");
+    assert.equal(me.body.provider.licenseNumber, "LIC-1");
+  });
+
+  it("ignores the wallet and verification status sent by the browser", async () => {
+    const wallet = newWallet();
+    const { body } = await signIn(wallet);
+    const registered = await request("POST", "/api/auth/provider", {
+      token: body.accessToken,
+      body: {
+        ...doctor,
+        wallet: newWallet().address,
+        verificationStatus: "verified",
+      },
+    });
+    assert.equal(registered.status, 201);
+    assert.equal(registered.body.provider.wallet, wallet.address);
+    assert.equal(registered.body.provider.verificationStatus, "pending");
+  });
+
+  it("rejects an unknown provider role and a missing name", async () => {
+    const { body } = await signIn(newWallet());
+    const unknown = await request("POST", "/api/auth/provider", {
+      token: body.accessToken,
+      body: { ...doctor, role: "admin" },
+    });
+    assert.equal(unknown.status, 400);
+    const unnamed = await request("POST", "/api/auth/provider", {
+      token: body.accessToken,
+      body: { ...doctor, name: "  " },
+    });
+    assert.equal(unnamed.status, 400);
+  });
+
+  it("does not let a wallet register twice", async () => {
+    const { body } = await signIn(newWallet());
+    const first = await request("POST", "/api/auth/provider", {
+      token: body.accessToken,
+      body: doctor,
+    });
+    assert.equal(first.status, 201);
+    const second = await request("POST", "/api/auth/provider", {
+      token: first.body.accessToken,
+      body: { ...doctor, role: "insurer" },
+    });
+    assert.equal(second.status, 409);
+  });
+
+  it("reads the role from the database on sign-in and on refresh", async () => {
+    const wallet = newWallet();
+    const before = await signIn(wallet);
+    await request("POST", "/api/auth/provider", {
+      token: before.body.accessToken,
+      body: doctor,
+    });
+    // A refresh token issued before the registration still carries "patient".
+    const refreshed = await request("POST", "/api/auth/refresh", {
+      body: { refreshToken: before.body.refreshToken },
+    });
+    assert.equal(refreshed.status, 200);
+    assert.equal(roleOf(refreshed.body.accessToken), "doctor");
+    const again = await signIn(wallet);
+    assert.equal(again.body.user.role, "doctor");
+  });
+
+  it("takes the requester's role for an access request from the server", async () => {
+    const patient = await signIn(newWallet());
+    const provider = await signIn(newWallet());
+    const registered = await request("POST", "/api/auth/provider", {
+      token: provider.body.accessToken,
+      body: doctor,
+    });
+    const created = await request("POST", "/api/access-requests", {
+      token: registered.body.accessToken,
+      body: {
+        patientId: patient.body.user.id,
+        role: "insurer",
+        reason: "Checkup",
+      },
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.role, "doctor");
+  });
+
+  it("rejects access requests from wallets that are not providers", async () => {
+    const patient = await signIn(newWallet());
+    const other = await signIn(newWallet());
+    const created = await request("POST", "/api/access-requests", {
+      token: other.body.accessToken,
+      body: { patientId: patient.body.user.id, role: "doctor" },
+    });
+    assert.equal(created.status, 403);
+  });
+});
+
+describe("rate limits", () => {
+  async function limitedApp(options: { max: number; now: () => number }) {
+    const app = express();
+    app.set("trust proxy", true);
+    app.post(
+      "/limited",
+      createRateLimiter({ windowMs: 60_000, ...options }),
+      (_req, res) => res.json({ ok: true })
+    );
+    const limited = app.listen(0);
+    await once(limited, "listening");
+    const url = `http://127.0.0.1:${
+      (limited.address() as AddressInfo).port
+    }/limited`;
+    const hit = (ip: string) =>
+      fetch(url, { method: "POST", headers: { "X-Forwarded-For": ip } });
+    return { hit, close: () => limited.close() };
+  }
+
+  it("answers 429 with Retry-After once a client exceeds the limit", async () => {
+    const { hit, close } = await limitedApp({ max: 2, now: () => 1_000 });
+    try {
+      assert.equal((await hit("203.0.113.1")).status, 200);
+      assert.equal((await hit("203.0.113.1")).status, 200);
+      const limited = await hit("203.0.113.1");
+      assert.equal(limited.status, 429);
+      assert.equal(limited.headers.get("retry-after"), "60");
+      assert.equal((await hit("203.0.113.2")).status, 200);
+    } finally {
+      close();
+    }
+  });
+
+  it("lets the client back in when the window ends", async () => {
+    let now = 1_000;
+    const { hit, close } = await limitedApp({ max: 1, now: () => now });
+    try {
+      assert.equal((await hit("203.0.113.3")).status, 200);
+      assert.equal((await hit("203.0.113.3")).status, 429);
+      now += 60_000;
+      assert.equal((await hit("203.0.113.3")).status, 200);
+    } finally {
+      close();
+    }
   });
 });

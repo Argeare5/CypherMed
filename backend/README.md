@@ -24,6 +24,7 @@ Then set at least:
 - `DATABASE_URL`: `postgresql://postgres:postgres@localhost:5432/cyphermed?schema=public` for the Docker Compose database
 - `JWT_SECRET`: a random value of at least 32 characters (`openssl rand -base64 32`); the backend refuses to start without it
 - `SIWX_ALLOWED_ORIGINS`: the frontend origins allowed in sign-in messages, comma-separated (default `http://localhost:3001`)
+- `TRUST_PROXY_HOPS`: the number of reverse proxies in front of the backend (Render: `1`), so the sign-in rate limit (`AUTH_RATE_LIMIT_PER_MINUTE`, default 10 per IP and minute) sees the client IP
 
 Generate Prisma client and run migrations
 
