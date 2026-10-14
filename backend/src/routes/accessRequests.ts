@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import prisma from "../prisma";
-import { isProviderRole, roleOf } from "../auth/roles";
+import { isProviderRole, providerOf } from "../auth/roles";
 import {
   notifyAccessRequest,
   notifyAccessGranted,
@@ -22,12 +22,19 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     // The requester's role comes from the provider registration on the server, not from the request body
-    const role = await roleOf(requester);
-    if (!isProviderRole(role)) {
+    const provider = await providerOf(requester);
+    if (!provider || !isProviderRole(provider.role)) {
       return res
         .status(403)
         .json({ error: "Only registered providers can request access" });
     }
+    // A pending or rejected registration cannot act as a provider yet
+    if (provider.verificationStatus !== "verified") {
+      return res.status(403).json({
+        error: "Only verified providers can request access",
+      });
+    }
+    const role = provider.role;
 
     // Verify patient exists
     const patient = await prisma.patient.findUnique({

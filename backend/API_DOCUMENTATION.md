@@ -53,7 +53,7 @@ Content-Type: application/json
   "institution": "City Hospital"
 }
 ```
-Registers the signed-in wallet (taken from the access token) as a provider with `verificationStatus: "pending"`, and returns `{ accessToken, refreshToken, provider }` with the provider role. A wallet or verification status in the body is ignored. Errors: `400` (unknown role, missing name), `409` (the wallet is already registered).
+Registers the signed-in wallet (taken from the access token) as a provider with `verificationStatus: "pending"` (a provider can request patient access only once it is `"verified"`), and returns `{ accessToken, refreshToken, provider }` with the provider role. A wallet or verification status in the body is ignored. Errors: `400` (unknown role, missing name), `409` (the wallet is already registered).
 
 ### Log Out
 ```http
@@ -451,7 +451,7 @@ Content-Type: application/json
   "expiresAt": "2026-01-15T00:00:00Z" (optional)
 }
 ```
-The requester is the signed-in wallet and its role comes from its provider registration (`POST /api/auth/provider`); a `requester` or `role` in the body is ignored. Wallets that are not registered providers get `403`.
+The requester is the signed-in wallet and its role comes from its provider registration (`POST /api/auth/provider`); a `requester` or `role` in the body is ignored. Wallets that are not registered providers get `403`, and so do providers whose `verificationStatus` is not `"verified"` (pending or rejected registrations).
 
 ### List Access Requests
 ```bash

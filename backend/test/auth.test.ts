@@ -394,10 +394,15 @@ describe("roles verified by the server", () => {
 
   it("takes the requester's role for an access request from the server", async () => {
     const patient = await signIn(newWallet());
-    const provider = await signIn(newWallet());
+    const providerWallet = newWallet();
+    const provider = await signIn(providerWallet);
     const registered = await request("POST", "/api/auth/provider", {
       token: provider.body.accessToken,
       body: doctor,
+    });
+    await prisma.provider.update({
+      where: { wallet: providerWallet.address },
+      data: { verificationStatus: "verified" },
     });
     const created = await request("POST", "/api/access-requests", {
       token: registered.body.accessToken,
@@ -409,6 +414,39 @@ describe("roles verified by the server", () => {
     });
     assert.equal(created.status, 201);
     assert.equal(created.body.role, "doctor");
+  });
+
+  it("rejects access requests from providers that are not verified yet", async () => {
+    const patient = await signIn(newWallet());
+    const providerWallet = newWallet();
+    const provider = await signIn(providerWallet);
+    const registered = await request("POST", "/api/auth/provider", {
+      token: provider.body.accessToken,
+      body: doctor,
+    });
+    const body = { patientId: patient.body.user.id, reason: "Checkup" };
+    const pending = await request("POST", "/api/access-requests", {
+      token: registered.body.accessToken,
+      body,
+    });
+    assert.equal(pending.status, 403);
+    assert.match(pending.body.error, /verified/);
+
+    await prisma.provider.update({
+      where: { wallet: providerWallet.address },
+      data: { verificationStatus: "rejected" },
+    });
+    const rejected = await request("POST", "/api/access-requests", {
+      token: registered.body.accessToken,
+      body,
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal(
+      await prisma.accessRequest.count({
+        where: { requester: providerWallet.address },
+      }),
+      0
+    );
   });
 
   it("rejects access requests from wallets that are not providers", async () => {

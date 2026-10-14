@@ -17,6 +17,16 @@ export function isProviderRole(role: unknown): role is ProviderRole {
   );
 }
 
+/** The provider registration of a wallet (role and verification status), or null for a patient. */
+export async function providerOf(
+  wallet: string
+): Promise<{ role: string; verificationStatus: string } | null> {
+  return prisma.provider.findUnique({
+    where: { wallet },
+    select: { role: true, verificationStatus: true },
+  });
+}
+
 /** The role the server has on record for a wallet: its provider role, or "patient". */
 export async function roleOf(wallet: string): Promise<string> {
   const provider = await prisma.provider.findUnique({
